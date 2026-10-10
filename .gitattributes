@@ -3,3 +3,4 @@
 *.qcad binary
 *.exe binary
 *.dll binary
+*.patch whitespace=-blank-at-eol

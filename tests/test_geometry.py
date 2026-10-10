@@ -112,4 +112,3 @@ def test_legacy_protocol():
             assert not result.is_error
             assert result.structured_content["document"]["units"] == "mm"
     asyncio.run(with_bridge(action))
-

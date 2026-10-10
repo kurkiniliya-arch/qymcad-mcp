@@ -19,4 +19,3 @@ if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'vendor/qymcad-app/TKe
 & $venvPython (Join-Path $PSScriptRoot 'make_config.py')
 if ($LASTEXITCODE -ne 0) { throw 'Configuration generation failed.' }
 Write-Output 'QymCAD MCP is ready. Run install_codex.ps1 to register it in Codex.'
-

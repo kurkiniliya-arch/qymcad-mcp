@@ -64,4 +64,3 @@ class Polygon(Record):
     points: Annotated[list[Point], Field(min_length=3, max_length=256)]
 
 Profile = Annotated[Rectangle | Circle | Polygon, Field(discriminator="kind")]
-
