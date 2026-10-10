@@ -12,13 +12,16 @@ from bridge import BASE, REVISION, Bridge
 from live import LiveBridge
 from schemas import Coordinate, Expression, Name, NodeId, Primitive, Profile, Size, Vector
 
-HELP = """QymCAD native parametric modeling, in millimetres. Create/open a document first.
+HELP = """QymCAD native parametric modeling, in millimetres. Inspect the existing document first.
+In headless mode create/open a document before modeling. In live mode the desktop document is
+already available; create/open replaces it with an undoable action, so use those only when intended.
 Each create_primitive without part_id creates a separate part. Within one part, material is joined.
 Sketches support rectangle, circle and closed polygon, on XY/XZ/YZ or an offset plane.
 Use extrude(mode='cut') for holes. Loft joins the first closed contour of each section in one part.
 Inspect returns stable ids, dimension keys, evaluated values, recipes, volumes and bounding boxes.
 Set dimensions with expressions and define named parameters. Every mutation rebuilds the actual
-QymCAD/OpenCASCADE model and is committed only on success; undo keeps 20 states in this session.
+QymCAD/OpenCASCADE model and is committed only on success. Headless undo keeps 20 states;
+live undo uses the desktop's shared history and its configured limit.
 Save .qcad to keep editable history. Export STL/STEP for one body or all unconsumed bodies.
 Files stay inside the configured workspace; overwrite must be explicit.
 With --live, tools edit the document in the linked desktop window. Manual edits are read before
@@ -26,7 +29,7 @@ each command. Concurrent document changes reject the commit; inspect and retry. 
 dialogs/sketch edits first. Undo shares the desktop history. Save writes a copy; Ctrl+S saves the
 window's current file. Without --live the document is private to this MCP connection.
 Imported projects need cached B-reps and a compatible QymCAD format. The source revision is pinned.
-Save before disconnecting: unsaved state is private to this MCP connection."""
+In headless mode save before disconnecting; in live mode the desktop retains its document."""
 
 READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
 EDIT = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
@@ -55,7 +58,7 @@ def create_server(bridge: Bridge):
 
     @server.tool(annotations=EDIT)
     async def qymcad_open_project(file: str) -> dict[str, Any]:
-        """Open a .qcad file from the workspace into a private editable copy."""
+        """Open a workspace .qcad; in live mode it becomes the current document of the window."""
         source = bridge.path(file, {".qcad"}, reading=True)
         return await bridge.change({"op": "inspect"}, source=source, fresh=True)
 
@@ -141,12 +144,12 @@ def create_server(bridge: Bridge):
 
     @server.tool(annotations=EDIT)
     async def qymcad_undo() -> dict[str, Any]:
-        """Restore the previous successful document state (up to 20 changes)."""
+        """Undo the last action: shared desktop history in live mode, 20 session states in headless mode."""
         return await bridge.undo()
 
     @server.tool(annotations=WRITE)
     async def qymcad_save_project(file: str, overwrite: bool = False) -> dict[str, Any]:
-        """Save the editable .qcad, including cached B-reps, inside the workspace."""
+        """Save an editable .qcad copy with B-reps. This does not mark the desktop document as saved."""
         return await bridge.save(file, overwrite)
 
     @server.tool(annotations=WRITE)
