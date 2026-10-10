@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.pytest_cache/
+backend/target/
+vendor/
+models/
+*.zip
+*.zip.sha256
+gui-target/
+.live/
+bin/
+mcp-config.json
+codex-config.toml
+publish-*.json
+tests-output/
+*.log
+package-check-*/

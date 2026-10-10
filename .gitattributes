@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.zip binary
+*.qcad binary
+*.exe binary
+*.dll binary

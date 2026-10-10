@@ -1,0 +1,18 @@
+[package]
+name = "qymcad-mcp-backend"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+qymcad-core = { path = "../../QymCAD/crates/qymcad-core" }
+qymcad-kernel = { path = "../../QymCAD/crates/qymcad-kernel" }
+qymcad-io = { path = "../../QymCAD/crates/qymcad-io" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 1

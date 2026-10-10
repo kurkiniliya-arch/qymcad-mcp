@@ -1,0 +1,522 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index d0e3e08..ed8ecbb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3498,6 +3498,7 @@ dependencies = [
+  "rfd",
+  "ron",
+  "serde",
++ "serde_json",
+  "sys-locale",
+  "time",
+  "unic-langid",
+diff --git a/crates/qymcad/Cargo.toml b/crates/qymcad/Cargo.toml
+index 0ee17cd..aa2fbb7 100644
+--- a/crates/qymcad/Cargo.toml
++++ b/crates/qymcad/Cargo.toml
+@@ -43,6 +43,7 @@ pollster = "0.4"
+ egui-phosphor = "0.13"
+ ron.workspace = true
+ serde = { workspace = true } # the view settings kept between sessions (ViewPrefs)
++serde_json = "1.0.151"
+ time.workspace = true # the calendar for the document stamp and the autosave clock
+ qymcad-paths = { path = "../qymcad-paths" }
+ qymcad-update = { path = "../qymcad-update" } # asking the site whether a newer version exists
+diff --git a/crates/qymcad/src/god_object_ratchet.rs b/crates/qymcad/src/god_object_ratchet.rs
+index 9abcf20..769181a 100644
+--- a/crates/qymcad/src/god_object_ratchet.rs
++++ b/crates/qymcad/src/god_object_ratchet.rs
+@@ -33,7 +33,7 @@ mod tests {
+     ///
+     /// The target is the few that are genuinely the application's own: start, the frame, the split into a
+     /// context. A panel's drawing is not the application's business and should not be reachable from it.
+-    const APP_METHODS_CEILING: usize = 167;
++    const APP_METHODS_CEILING: usize = 166;
+ 
+     /// The size of what lives inside `impl App` blocks, comments included, counted in WORD CHARACTERS (`word_chars`)
+     /// rather than in lines. Lines were the measure until the tree was first formatted: rustfmt took the same code
+@@ -49,7 +49,7 @@ mod tests {
+     /// It also cannot be gamed the other way. Splitting a method in two adds a line and no more; the only
+     /// way this number falls is code leaving `impl App`. That is the thing that has to reach zero before the
+     /// interface can live in a crate of its own, since a method belongs to the crate declaring the type.
+-    const APP_SIZE_CEILING: usize = 178_324;
++    const APP_SIZE_CEILING: usize = 177_404;
+ 
+     /// Methods that exist ONLY so a check can reach inside - `*_for_test` and `*_pub`.
+     ///
+diff --git a/crates/qymcad/src/gui.rs b/crates/qymcad/src/gui.rs
+index a5450c7..be3905c 100644
+--- a/crates/qymcad/src/gui.rs
++++ b/crates/qymcad/src/gui.rs
+@@ -13,6 +13,8 @@ use qymcad_kernel::OcctKernel; // THE ONLY kernel implementation, shared with th
+ use qymcad_core::geom::{MeshFace, Point2};
+ 
+ use qymcad_core::model::{Id, Project};
++mod live_bridge;
++mod selection_sync;
+ 
+ /// THE APPLICATION'S NAME for eframe. It is also the key of the directory eframe puts the settings file into, so
+ /// it lives as one constant: were those two places to diverge, the settings window would show the path of a
+@@ -1940,6 +1942,7 @@ impl App {
+         }
+         // the reference window's keys go nowhere else: Esc must not walk the cancel ladder, E must not extrude
+         let capturing = hotkeys::hotkeys_take_keyboard(&mut self.win, &mut self.hotkeys, ctx);
++        live_bridge::tick(ctx, &mut self.part_ctx(), choosing || capturing).finish(&mut self.disk.project_path, &mut self.set, &mut self.active_path);
+         // Ctrl+S saves (silently into the current file, or a dialogue for a new one); Ctrl+Shift+S is "save as".
+         if !choosing && !capturing && !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+             if ctx.input(|i| i.modifiers.shift) {
+@@ -1965,9 +1968,9 @@ impl App {
+         }
+         self.sync_workbench(); // the workbench and the active context are derived from `active_path` (drill in and out)
+         self.chosen.hover.joint = None; // the hovered joint is rebuilt every frame (by the panel and by 3D below)
+-        self.keep_selection_on_edited_sketch(); // the selection follows the sketch being edited — in one phase
+-                                                // THE KEYBOARD IS THE CHOOSER'S while it is open: a barrier eats clicks, but these two read the
+-                                                // input directly and would go on obeying Delete, Escape and every tool letter behind it.
++        selection_sync::follow(&self.project, &mut self.sketch_ses, &mut self.chosen.sel, &mut self.workbench, &mut self.tools.sel_sk); // the selection follows the sketch being edited — in one phase
++                                                                                                                                        // THE KEYBOARD IS THE CHOOSER'S while it is open: a barrier eats clicks, but these two read the
++                                                                                                                                        // input directly and would go on obeying Delete, Escape and every tool letter behind it.
+         if !choosing && !capturing {
+             self.handle_key_commands(ctx); // the frame's keyboard commands — in one phase
+             self.handle_tool_hotkeys(ctx); // the tool shortcuts (L/R/C/A/P/G/D/S, E)
+@@ -2487,40 +2490,6 @@ impl App {
+         true
+     }
+ 
+-    /// THE SELECTION FOLLOWS THE SKETCH BEING EDITED.
+-    ///
+-    /// While a sketch is being edited the selection stays on it (all the logic works through `Sel::Sketch`),
+-    /// and the sketch itself is remembered for projecting the part's geometry into it. Changing the active
+-    /// sketch clears the accumulated selection — otherwise it moves onto SOMEONE ELSE'S geometry. A phase
+-    /// of the frame rather than an implementation detail of a neighbouring block: this used to sit between
+-    /// the window-close interception and the keyboard, and the link "the sketch changed, so the selection
+-    /// was cleared" was invisible.
+-    fn keep_selection_on_edited_sketch(&mut self) {
+-        // sketch editing mode: the selection is kept on it (all the logic works through `Sel::Sketch`)
+-        match edit_si(&self.project, &self.sketch_ses) {
+-            Some(si) => {
+-                self.chosen.sel = Sel::Sketch(si);
+-                self.workbench = Workbench::Sketch;
+-            }
+-            None => {
+-                if self.sketch_ses.editing.is_some() {
+-                    self.sketch_ses.editing = None; // the sketch is gone, so leave the mode
+-                }
+-            }
+-        }
+-        // remember the active sketch (for projecting the part's geometry into it)
+-        if let Sel::Sketch(si) = self.chosen.sel {
+-            if let Some(s) = self.project.sketches.get(si) {
+-                if self.sketch_ses.last != Some(s.id) {
+-                    self.tools.sel_sk.clear(); // the selection, and whatever was waiting on it: the sketch changed, so the element selection goes
+-                }
+-                self.sketch_ses.last = Some(s.id);
+-            }
+-        } else {
+-            self.tools.sel_sk.clear(); // the selection, and whatever was waiting on it
+-        }
+-    }
+-
+     pub(crate) fn viewport(&mut self, ui: &mut egui::Ui) {
+         // The panel lives inside a `Ui` now; the context is still wanted for windows,
+         // input and viewport commands, and it comes from the same place.
+diff --git a/crates/qymcad/src/gui/panels_source.rs b/crates/qymcad/src/gui/panels_source.rs
+index 657236d..2013243 100644
+--- a/crates/qymcad/src/gui/panels_source.rs
++++ b/crates/qymcad/src/gui/panels_source.rs
+@@ -121,7 +121,8 @@ mod tests {
+         // KEYED BY PATH, not by file name. Every workbench crate is a single `lib.rs`, so an exception
+         // written as "lib.rs" would have quietly excused the Part, the sketcher and the assembly along with
+         // the one file it was meant for.
+-        const NOT_A_PANEL: [(&str, &str); 6] = [
++        const NOT_A_PANEL: [(&str, &str); 7] = [
++            ("qymcad/src/gui/live_bridge.rs", "local document transactions: it reads frame state and requests a screenshot, but draws no widgets"),
+             ("qymcad/src/gui/input.rs", "keyboard handling: it draws nothing, it only takes a frame's context to read keys from"),
+             ("qymcad/src/gui/orbit_about.rs", "the centre of a turn of the view: it draws nothing, it only keeps the point of a turn in a frame's context memory"),
+             ("qymcad-part/src/trial.rs", "the trial build of a command: it draws nothing, it only keeps its verdict in a frame's context memory"),
+diff --git a/crates/qymcad/src/gui/session.rs b/crates/qymcad/src/gui/session.rs
+index 4b550e1..6e0ba44 100644
+--- a/crates/qymcad/src/gui/session.rs
++++ b/crates/qymcad/src/gui/session.rs
+@@ -361,6 +361,11 @@ pub enum SketchPick {
+ }
+ 
+ impl Session {
++    /// Connect a private local transaction directory to this window.
++    pub fn connect_local_bridge(&mut self, directory: std::path::PathBuf) {
++        super::live_bridge::bind(&self.win.ctx, directory);
++    }
++
+     /// START THE PROGRAM on a machine of its defaults, and wait until it is ready for a person.
+     pub fn start() -> Session {
+         Session::start_on(Machine::default())
+diff --git a/crates/qymcad/src/gui/live_bridge.rs b/crates/qymcad/src/gui/live_bridge.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/qymcad/src/gui/live_bridge.rs
+@@ -0,0 +1,236 @@
++//! Local file transactions against the document shown by the window.
++use qymcad_ui_state::{PartCtx, Settings, doc_key};
++use serde::Deserialize;
++use serde_json::{Value, json};
++use std::path::{Path, PathBuf};
++use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
++
++#[derive(Clone)]
++struct Endpoint {
++    root: Option<PathBuf>,
++    polled: Instant,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Request {
++    op: String,
++    deadline_ms: u64,
++    revision: Option<String>,
++    document: Option<String>,
++}
++
++#[derive(Default)]
++pub(super) struct Applied {
++    document: Option<String>,
++    active_path: Option<Vec<u64>>,
++}
++
++impl Applied {
++    pub(super) fn finish(self, project_path: &mut Option<String>, set: &mut Settings, active_path: &mut Vec<u64>) {
++        if let Some(path) = self.document {
++            if path.is_empty() {
++                *project_path = None;
++            } else {
++                super::set_project_path(project_path, set, path);
++            }
++        }
++        if let Some(path) = self.active_path {
++            *active_path = path;
++        }
++    }
++}
++
++pub(super) fn bind(ctx: &egui::Context, root: PathBuf) {
++    ctx.data_mut(|d| d.insert_temp(egui::Id::new("local-document-bridge"), Endpoint { root: Some(root), polled: Instant::now() - Duration::from_secs(1) }));
++}
++
++fn revision(pc: &PartCtx<'_>) -> String {
++    format!("{:016x}", doc_key(pc.project))
++}
++
++fn write_reply(folder: &Path, reply: Value) -> Result<(), String> {
++    let tmp = folder.join("response.tmp");
++    std::fs::write(&tmp, serde_json::to_vec(&reply).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
++    std::fs::rename(tmp, folder.join("response.json")).map_err(|e| e.to_string())
++}
++
++fn snapshot(pc: &PartCtx<'_>, folder: &Path) -> Result<(), String> {
++    let _gate = qymcad_kernel::kernel_gate();
++    let mut blobs = pc.live.blobs.clone();
++    for (id, shape) in &pc.live.shapes {
++        if let Some(bytes) = shape.to_brep_bytes() {
++            blobs.insert(*id, bytes);
++        }
++    }
++    let breps: Vec<_> = blobs.into_iter().collect();
++    let target = folder.join("snapshot.qcad");
++    qymcad_io::save_project_with_brep(pc.project, &target.to_string_lossy(), &breps)
++}
++
++fn apply(pc: &mut PartCtx<'_>, folder: &Path) -> Result<(), String> {
++    let path = folder.join("candidate.qcad");
++    if path.symlink_metadata().map_err(|e| e.to_string())?.is_symlink() {
++        return Err("Candidate must be a regular local file".into());
++    }
++    if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > 100 * 1024 * 1024 {
++        return Err("Candidate exceeds 100 MB".into());
++    }
++    let loaded = qymcad_io::load_project_with_brep(&path.to_string_lossy())?;
++    let mut shapes = std::collections::HashMap::new();
++    {
++        let _gate = qymcad_kernel::kernel_gate();
++        for (id, bytes) in &loaded.breps {
++            let shape = qymcad_kernel::Shape::from_brep_bytes(bytes).ok_or("Invalid cached B-rep")?;
++            if !shape.is_valid() {
++                return Err("Invalid solid in candidate".into());
++            }
++            shapes.insert(*id, shape);
++        }
++    }
++    qymcad_ui_state::begin_edit(pc.edits, pc.project, qymcad_i18n::tr("undo-edit"));
++    // Keep source bytes for undo and redo, including document replacement.
++    for source in &pc.project.sources {
++        pc.live.shelved_sources.insert(source.id, source.data.clone());
++    }
++    pc.live.shelved.extend(std::mem::take(&mut pc.live.shapes));
++    *pc.project = loaded.project;
++    pc.live.shapes = shapes;
++    pc.live.blobs = loaded.breps.into_iter().collect();
++    pc.live.faces = pc.project.bodies.iter().map(|b| (b.id, b.faces.clone())).collect();
++    pc.live.ready = true;
++    pc.live.tried_rev = None;
++    pc.live.wait = None;
++    *pc.sel = qymcad_ui_state::Sel::None;
++    *pc.gsel = Default::default();
++    pc.sketch_ses.editing = None;
++    pc.sketch_ses.last = None;
++    pc.params_seen.clear();
++    *pc.mode_3d = true;
++    pc.win.show_start(false);
++    qymcad_part::resync_after_topology_change(pc);
++    qymcad_ui_state::commit_edit(&mut pc.rebuild());
++    Ok(())
++}
++
++fn execute(request: &Request, folder: &Path, pc: &mut PartCtx<'_>) -> Result<Applied, String> {
++    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis();
++    if now > request.deadline_ms as u128 {
++        return Err("Request expired without changing the document".into());
++    }
++    let mut applied = Applied::default();
++    match request.op.as_str() {
++        "snapshot" => snapshot(pc, folder)?,
++        "apply" | "undo" | "redo" => {
++            if request.revision.as_deref() != Some(&revision(pc)) {
++                return Err("Document changed in the window; inspect it and retry the operation".into());
++            }
++            if request.op == "apply" {
++                apply(pc, folder)?;
++                applied.document = request.document.clone();
++                applied.active_path = Some(qymcad_ui_state::context_path_to(pc.project, pc.project.active_component.unwrap_or(pc.project.root)));
++            } else {
++                applied.active_path = qymcad_ui_state::step_through_history(&mut pc.rebuild(), request.op == "redo");
++                if applied.active_path.is_none() {
++                    return Err("No history step is available".into());
++                }
++            }
++        }
++        "fit" => pc.cam.init = false,
++        "status" | "screenshot" => {}
++        _ => return Err("Unknown live operation".into()),
++    }
++    Ok(applied)
++}
++
++pub(super) fn tick(ctx: &egui::Context, pc: &mut PartCtx<'_>, blocked: bool) -> Applied {
++    let key = egui::Id::new("local-document-bridge");
++    let mut endpoint =
++        ctx.data_mut(|d| d.get_temp::<Endpoint>(key)).unwrap_or_else(|| Endpoint { root: std::env::var_os("QYMCAD_LIVE_DIR").map(PathBuf::from), polled: Instant::now() - Duration::from_secs(1) });
++    let Some(root) = endpoint.root.clone() else {
++        ctx.data_mut(|d| d.insert_temp(key, endpoint));
++        return Applied::default();
++    };
++    ctx.input(|i| {
++        for event in &i.events {
++            if let egui::Event::Screenshot { user_data, image, .. } = event {
++                let Some(folder) = user_data.data.as_ref().and_then(|d| d.downcast_ref::<PathBuf>()) else { continue };
++                if folder.parent() != Some(root.as_path()) || !folder.join("processing.json").is_file() {
++                    continue;
++                }
++                let reply =
++                    match super::color_image_to_png(image).ok_or("Screenshot encoding failed").and_then(|png| std::fs::write(folder.join("window.png"), png).map_err(|_| "Screenshot write failed")) {
++                        Ok(()) => json!({"ok": true, "revision": revision(pc)}),
++                        Err(error) => json!({"ok": false, "error": error}),
++                    };
++                let _ = write_reply(folder, reply);
++            }
++        }
++    });
++    ctx.request_repaint_after(Duration::from_millis(250));
++    if endpoint.polled.elapsed() < Duration::from_millis(80) {
++        return Applied::default();
++    }
++    endpoint.polled = Instant::now();
++    ctx.data_mut(|d| d.insert_temp(key, endpoint));
++    let busy = blocked
++        || pc.regen.busy.is_some()
++        || pc.regen.regen_running()
++        || pc.regen.wanted
++        || pc.edits.open.is_some()
++        || pc.sketch_ses.editing.is_some()
++        || matches!(pc.armed, qymcad_ui_state::Armed::Command(_))
++        || ctx.egui_wants_keyboard_input()
++        || ctx.input(|i| i.pointer.any_down());
++    let Ok(entries) = std::fs::read_dir(&root) else { return Applied::default() };
++    for entry in entries.flatten() {
++        let name = entry.file_name().to_string_lossy().into_owned();
++        if name.len() != 32 || !name.bytes().all(|b| b.is_ascii_hexdigit()) || !entry.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink()) {
++            continue;
++        }
++        let folder = entry.path();
++        let file = folder.join("request.json");
++        if !file.is_file() || folder.join("response.json").exists() {
++            continue;
++        }
++        let result = std::fs::read(&file).map_err(|e| e.to_string()).and_then(|bytes| {
++            if bytes.len() > 16384 {
++                return Err("Request too large".into());
++            }
++            serde_json::from_slice::<Request>(&bytes).map_err(|e| e.to_string())
++        });
++        if std::fs::rename(&file, folder.join("processing.json")).is_err() {
++            continue;
++        }
++        let request = match result {
++            Ok(request) => request,
++            Err(error) => {
++                let _ = write_reply(&folder, json!({"ok": false, "error": error}));
++                continue;
++            }
++        };
++        if busy && request.op != "status" {
++            let _ = write_reply(&folder, json!({"ok": false, "error": "Window is busy: finish the active edit, dialog or rebuild, then retry"}));
++            continue;
++        }
++        match execute(&request, &folder, pc) {
++            Ok(applied) => {
++                if request.op == "screenshot" {
++                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(folder)));
++                    return applied;
++                }
++                let _ = write_reply(
++                    &folder,
++                    json!({"ok": true, "revision": revision(pc), "busy": busy,
++                    "pid": std::process::id(), "protocol": 1, "undo_steps": pc.edits.undo.len(), "redo_steps": pc.edits.redo.len()}),
++                );
++                ctx.request_repaint();
++                return applied;
++            }
++            Err(error) => {
++                let _ = write_reply(&folder, json!({"ok": false, "error": error}));
++            }
++        }
++    }
++    Applied::default()
++}
+diff --git a/crates/qymcad/src/gui/selection_sync.rs b/crates/qymcad/src/gui/selection_sync.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/qymcad/src/gui/selection_sync.rs
+@@ -0,0 +1,23 @@
++//! Keep selection attached to the sketch currently being edited.
++use qymcad_core::model::Project;
++use qymcad_ui_state::{Sel, SketchSelection, SketchSession, Workbench};
++
++pub(super) fn follow(project: &Project, session: &mut SketchSession, selection: &mut Sel, workbench: &mut Workbench, elements: &mut SketchSelection) {
++    match qymcad_ui_state::edit_si(project, session) {
++        Some(si) => {
++            *selection = Sel::Sketch(si);
++            *workbench = Workbench::Sketch;
++        }
++        None => session.editing = None,
++    }
++    if let Sel::Sketch(si) = *selection {
++        if let Some(sketch) = project.sketches.get(si) {
++            if session.last != Some(sketch.id) {
++                elements.clear();
++            }
++            session.last = Some(sketch.id);
++        }
++    } else {
++        elements.clear();
++    }
++}
+diff --git a/crates/qymcad/tests/live_bridge.rs b/crates/qymcad/tests/live_bridge.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/qymcad/tests/live_bridge.rs
+@@ -0,0 +1,97 @@
++use qymcad::{Key, Machine, Modifiers, Session};
++use serde_json::{Value, json};
++use std::path::{Path, PathBuf};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++fn folder(root: &Path, number: u64) -> PathBuf {
++    let path = root.join(format!("{number:032x}"));
++    std::fs::create_dir_all(&path).unwrap();
++    path
++}
++
++fn request(session: &mut Session, folder: &Path, operation: &str, revision: Option<&str>, deadline: u64) -> Value {
++    std::fs::write(
++        folder.join("request.json"),
++        serde_json::to_vec(&json!({"op": operation, "revision": revision,
++        "deadline_ms": deadline, "document": null}))
++        .unwrap(),
++    )
++    .unwrap();
++    for _ in 0..30 {
++        session.pause(Duration::from_millis(100));
++        if let Ok(bytes) = std::fs::read(folder.join("response.json")) {
++            return serde_json::from_slice(&bytes).unwrap();
++        }
++    }
++    panic!("The window did not answer {operation}");
++}
++
++fn candidate(path: &Path) {
++    let _gate = qymcad_kernel::kernel_gate();
++    let mut project = qymcad_core::model::Project::default();
++    project.new_empty_document();
++    let part = project.add_part("Live cylinder");
++    project.set_active_component(Some(part));
++    let body = project.add_cylinder(7.0, 19.0);
++    project.finish_base_body(body, 1);
++    let kernel = qymcad_kernel::OcctKernel::default();
++    let report = project.regenerate(&kernel);
++    assert!(report.errors.is_empty());
++    for (id, faces) in report.built {
++        project.set_body_faces(id, faces);
++    }
++    let breps: Vec<_> = kernel.shapes.borrow().iter().map(|(id, s)| (*id, s.to_brep_bytes().unwrap())).collect();
++    qymcad_io::save_project_with_brep(&project, &path.to_string_lossy(), &breps).unwrap();
++}
++
++#[test]
++fn live_window_transactions_and_keyboard_undo_share_one_document() {
++    let root = std::env::temp_dir().join(format!("qymcad-live-test-{}", std::process::id()));
++    std::fs::create_dir_all(&root).unwrap();
++    let home = root.join("home");
++    let endpoint = root.join("endpoint");
++    std::fs::create_dir_all(&endpoint).unwrap();
++    let mut session = Session::start_on(Machine { home, greeting: false, ..Default::default() });
++    session.budget(Duration::from_secs(20));
++    session.connect_local_bridge(endpoint.clone());
++    let original = session.document();
++    let deadline = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() + 120_000) as u64;
++    let before = request(&mut session, &folder(&endpoint, 1), "snapshot", None, deadline);
++    assert_eq!(before["ok"], true);
++    assert!(endpoint.join(format!("{:032x}/snapshot.qcad", 1)).is_file());
++    let revision = before["revision"].as_str().unwrap();
++    let commit = folder(&endpoint, 2);
++    candidate(&commit.join("candidate.qcad"));
++    let done = request(&mut session, &commit, "apply", Some(revision), deadline);
++    assert_eq!(done["ok"], true, "{done}");
++    let changed = session.document();
++    assert!(changed.parts.iter().any(|p| p.name == "Live cylinder"));
++    assert!(changed.unsaved);
++    assert_eq!(changed.undo.len(), original.undo.len() + 1);
++    assert!(changed.features.iter().all(|f| f.error.is_none()));
++    let picture = session.snapshot();
++    assert!(picture.width > 100 && picture.height > 100);
++    assert!(picture.rgba.chunks_exact(4).any(|pixel| pixel[0] != pixel[1]));
++    std::fs::write(root.join("live-window.png"), picture.png()).unwrap();
++    let stale = folder(&endpoint, 3);
++    candidate(&stale.join("candidate.qcad"));
++    let rejected = request(&mut session, &stale, "apply", Some(revision), deadline);
++    assert_eq!(rejected["ok"], false);
++    assert_eq!(changed, session.document());
++    let expired = request(&mut session, &folder(&endpoint, 4), "undo", done["revision"].as_str(), 1);
++    assert_eq!(expired["ok"], false);
++    assert_eq!(changed, session.document());
++    session.chord(Modifiers::COMMAND, Key::Z);
++    assert_eq!(session.document().parts, original.parts);
++    let manual = request(&mut session, &folder(&endpoint, 5), "snapshot", None, deadline);
++    assert_ne!(manual["revision"], done["revision"]);
++    let redone = request(&mut session, &folder(&endpoint, 6), "redo", manual["revision"].as_str(), deadline);
++    assert_eq!(redone["ok"], true, "{redone}");
++    assert_eq!(session.document().parts, changed.parts);
++    let undo = request(&mut session, &folder(&endpoint, 7), "undo", redone["revision"].as_str(), deadline);
++    assert_eq!(undo["ok"], true, "{undo}");
++    assert_eq!(session.document().parts, original.parts);
++    let bad = request(&mut session, &folder(&endpoint, 8), "shell", None, deadline);
++    assert_eq!(bad["ok"], false);
++    println!("Preview: {}", root.join("live-window.png").display());
++}
