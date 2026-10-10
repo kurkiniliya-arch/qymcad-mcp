@@ -15,6 +15,8 @@ def main():
     for folder in ("bin", "backend/src", "sources", "patches", "tests", "vendor/qymcad-app", "models/demo"):
         files.extend(p for p in (ROOT / folder).rglob("*") if p.is_file() and "__pycache__" not in p.parts)
     files.extend([ROOT / "backend/Cargo.toml", ROOT / "backend/Cargo.lock"])
+    # Only the matching patched desktop is distributed; this folder supplies runtime DLLs.
+    files = [path for path in files if path != ROOT / "vendor/qymcad-app/qymcad.exe"]
     with zipfile.ZipFile(TARGET, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for path in sorted(set(files)):
             archive.write(path, "qymcad-mcp/" + path.relative_to(ROOT).as_posix())
